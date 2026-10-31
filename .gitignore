@@ -1,19 +1,14 @@
 # 构建产物（体积大，按需重新生成，不进版本库）
-# 手表安装包：scripts/build.ps1
-dist/*.apk
-# 中继桌面程序：scripts/build-app.ps1（-OutputDir 的临时目录同样忽略）
-dist/DSH中继*/
-# 中继命令行版：scripts/pack-relay.ps1（含 Node 运行时，单文件近 90MB）
-dist/中继命令行版/
+dist/
 build/
-build-app/
 *.class
 *.dex
+*.apk
+*.jks
+keystore.properties
 
-# 程序运行时在自身目录生成的东西
-startup.log
-debug.log
-WebView2Loader.dll
+# 本地下载的 Android SDK（scripts/fetch-sdk.sh 的目标目录）
+sdk/
 
 # 本地环境
 .env
@@ -23,12 +18,3 @@ WebView2Loader.dll
 # 系统
 .DS_Store
 Thumbs.db
-
-# 浏览器数据（运行时生成，位置随版本变化）
-*.WebView2/
-
-# 介绍片成片与封面（上传 B 站用）；制作脚本在 docs/介绍片制作/
-docs/*.mp4
-docs/*.png
-# 介绍片制作素材（字体 24MB，本机留档，不进版本库）
-docs/介绍片制作/

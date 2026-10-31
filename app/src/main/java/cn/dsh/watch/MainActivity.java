@@ -41,8 +41,8 @@ public class MainActivity extends Activity {
 
     private WatchUi ui;
     private Store store;
-    private Api api;
-    private Discovery discovery;
+    /** 直连 DSH 的数据层（取代旧版「电脑上的中继」）。 */
+    private Direct direct;
 
     private final List<Api.Session> sessions = new ArrayList<>();
     private final List<Api.Project> projects = new ArrayList<>();
@@ -181,12 +181,11 @@ public class MainActivity extends Activity {
         // 晚一步就会先画一屏旧样式再跳变。
         WatchUi.applyTheme(store.theme());
         WatchUi.roundOptimized = store.roundOptimized();
-        api = new Api();
-        discovery = new Discovery();
+        direct = new Direct();
         // 允许从外部带入地址与配对码（例如电脑端生成一条命令让手表直接配对），
         // 省去在手表小键盘上输入 IP 的麻烦。
         applyIntentExtras(getIntent());
-        if (hasPendingPairing()) {
+        if (hasPendingAddress()) {
             // 带参数启动时优先去设置页：已配对过也要允许用新参数覆盖，
             // 否则 adb 命令对一台配过对的手表完全无效。
             showConnect();
@@ -212,68 +211,82 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         applyIntentExtras(intent);
-        if (hasPendingPairing()) showConnect();
+        if (hasPendingAddress()) showConnect();
     }
 
-    /** 当前是否有待用的配对参数（地址与配对码都齐）。 */
-    private boolean hasPendingPairing() {
-        return !pendingHost.isEmpty() && !pendingCode.isEmpty();
+    /** 是否有外部带进来的网址（用于预填设置页）。 */
+    private boolean hasPendingAddress() {
+        return !pendingHost.isEmpty();
     }
 
     /**
      * 读取启动参数并预填设置页。
      *
-     * 支持 `--es host <地址>`（可含端口或 https://）、`--ei port <端口>`、
-     * `--es code <配对码>`，便于从电脑上用一条 adb 命令把配对信息送到手表，
-     * 省去在小键盘上输入。
+     * 支持 `--es url <带 token 的完整网址>`（也接受旧的 `--es host` 与 `--ei port`），
+     * 便于用一条 adb 命令把连接信息送到手表，省去在小键盘上敲一长串网址。
      */
     private void applyIntentExtras(Intent intent) {
         if (intent == null) return;
+        String url = intent.getStringExtra("url");
         String host = intent.getStringExtra("host");
-        String code = intent.getStringExtra("code");
         int port = intent.getIntExtra("port", 0);
+        if (url != null && !url.trim().isEmpty()) {
+            pendingHost = url.trim();
+            return;
+        }
         if (host != null && !host.trim().isEmpty()) {
             pendingHost = host.trim();
-            // 只给了主机名而另给了端口时，合成 host:port 再交给统一解析。
             if (port > 0 && port <= 65535 && pendingHost.indexOf(':') < 0 && !pendingHost.contains("://")) {
                 pendingHost = pendingHost + ":" + port;
             }
-            pendingCode = code == null ? "" : code.trim();
-        }
-        // autopair：带上就免去再点一次「配对并连接」，便于用 adb 一次性配好。
-        if (intent.getBooleanExtra("autopair", false) && !pendingHost.isEmpty() && !pendingCode.isEmpty()) {
-            autoPair = true;
         }
     }
 
     /**
-     * 校验两个输入框并开始配对。
+     * 用「带 token 的网址」连接。
      *
-     * 抽成方法是为了让「配对并连接」按钮与 autopair 启动参数走同一条路径——
-     * 两处各写一遍校验迟早会不一致。
+     * 原先这里是「地址 + 6 位配对码」，现在只需要一条网址：token 就在网址里，
+     * 手表拿它换一张长期有效的会话 cookie（见 DshLink）。
      */
-    private void pairNow(EditText hostField, EditText codeField, TextView status) {
-        String address = hostField.getText().toString().trim();
-        String code = codeField.getText().toString().trim();
-        if (address.isEmpty()) {
+    private void connectNow(EditText urlField, TextView status) {
+        String raw = urlField.getText().toString().trim();
+        if (raw.isEmpty()) {
             status.setTextColor(WatchUi.WARN);
-            status.setText("请先填写地址");
+            status.setText("请先粘贴带 token 的网址");
             return;
         }
-        if (code.isEmpty()) {
-            status.setTextColor(WatchUi.WARN);
-            status.setText("请填写电脑上显示的 6 位配对码");
-            return;
-        }
-        Store.Endpoint endpoint = Store.parse(address, DEFAULT_RELAY_PORT);
+        Store.Endpoint endpoint = Store.parse(raw, DEFAULT_DSH_PORT);
         if (endpoint == null) {
             status.setTextColor(WatchUi.DANGER);
-            status.setText("地址格式不对，示例：192.168.1.121 或 https://abc.com");
+            status.setText("网址格式不对，示例：https://abc.com/?token=…");
+            return;
+        }
+        String token = Store.tokenOf(raw);
+        if (token.isEmpty()) {
+            status.setTextColor(WatchUi.WARN);
+            status.setText("网址里没有 token，请在电脑上重新复制完整网址");
             return;
         }
         status.setTextColor(WatchUi.MUTED);
-        status.setText("正在配对…");
-        tryPair(endpoint, code, status);
+        status.setText("正在连接…");
+        final String base = endpoint.url("");
+        direct.login(base, token, endpoint.isSecure(), result -> {
+            if (destroyed) return;
+            if (!result.ok) {
+                status.setTextColor(WatchUi.DANGER);
+                status.setText(result.error);
+                return;
+            }
+            store.rememberDevice(base, token, "");
+            currentSessionId = "";
+            currentSessionTitle = "";
+            currentAsk = null;
+            steps.clear();
+            status.setTextColor(WatchUi.OK);
+            status.setText("已连接，正在载入会话…");
+            startEventStream();
+            showSessionList();
+        });
     }
 
     /** 延迟执行（配对需要等界面挂上以后再发请求）。 */
@@ -286,12 +299,8 @@ public class MainActivity extends Activity {
         }, delayMs);
     }
 
+    /** 外部（adb）带进来的网址，用于预填设置页。 */
     private String pendingHost = "";
-    private String pendingCode = "";
-    /** 启动参数要求直接配对（见 applyIntentExtras）。 */
-    private boolean autoPair = false;
-    /** 一键配对进行中（界面据此显示「取消」而不是「重试」）。 */
-    private boolean quickPairing = false;
 
     /** 读 JSON 字符串字段，缺失或为 null 时给空串。 */
     private static String textOf(JSONObject object, String key) {
@@ -304,7 +313,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         destroyed = true;
         refresh.removeCallbacksAndMessages(null);
-        discovery.cancel();
+        if (direct != null) direct.disconnect();
         super.onDestroy();
     }
 
@@ -367,26 +376,50 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------- 设置 / 连接页
 
-    /** 默认的局域网中继端口。 */
-    private static final int DEFAULT_RELAY_PORT = 19390;
+    /** DSH 的默认端口（`dsh web` 的常用值）。 */
+    private static final int DEFAULT_DSH_PORT = 3377;
 
-    /** 当前配置对应的请求根地址（形如 http://192.168.1.121:19390 或 https://host）。 */
+    /** 当前配置对应的请求根地址（形如 http://192.168.1.121:3377 或 https://host）。 */
     private String baseUrl() {
-        Store.Endpoint endpoint = Store.parse(store.base(), DEFAULT_RELAY_PORT);
+        Store.Endpoint endpoint = Store.parse(store.base(), DEFAULT_DSH_PORT);
         if (endpoint == null) return "";
-        // url("") 会拼出以 / 结尾的根地址，供 Api 直接拼接路径。
         return endpoint.url("/").replaceAll("/$", "");
     }
 
+    /** 当前地址是否用自签名/普通证书的 HTTPS（放行任意证书的策略与 Api 一致）。 */
+    private boolean insecureTls() {
+        Store.Endpoint endpoint = Store.parse(store.base(), DEFAULT_DSH_PORT);
+        return endpoint != null && endpoint.isSecure();
+    }
+
     /**
-     * 设置页：配置要连接的设备（局域网或公网）。
+     * 打开事件流。
      *
-     * 从会话页左滑菜单的「设置」进入，未配对时也作为首次连接页使用。
+     * 只有它能发现「前台正在等待回答」的提问：这类问题不进投影，只通过 waterfall
+     * 帧推给在线客户端。连上之后顺带把列表刷新一次，让待答提示立刻出现。
+     */
+    private void startEventStream() {
+        if (!store.paired()) return;
+        direct.startEvents(baseUrl(), store.token(), insecureTls(),
+                () -> {
+                    if (destroyed) return;
+                    // 收到新提问：如果正停在列表页就轻刷一下，让提示出现。
+                    if (onListPage()) loadSessions(true, false);
+                },
+                () -> { /* 连接状态变化：目前不需要额外处理 */ });
+    }
+
+    /**
+     * 设置页：只需要一条「带 token 的 DSH 网址」。
+     *
+     * 与旧版的区别：不再有配对码、不再有局域网发现。DSH 一直跑在服务器上，
+     * 用户只要把电脑浏览器里那条带 `?token=` 的地址粘过来，手表就能自己换一张
+     * 长期会话 cookie，之后一直用它。
      */
     private void showConnect() {
         onSessionPage = false;
         WatchUi.Page page = ui.page();
-        ui.heading(page, "设置", store.paired() ? "当前已连接" : "填写电脑地址与配对码");
+        ui.heading(page, "设置", store.paired() ? "当前已连接" : "粘贴带 token 的网址");
 
         if (store.paired()) {
             LinearLayout current = ui.card();
@@ -394,25 +427,27 @@ public class MainActivity extends Activity {
             TextView address = ui.text(store.base(), 12, WatchUi.FG);
             address.setPadding(0, ui.dp(5), 0, 0);
             current.addView(address);
+            // 地址里不显示 token：那串东西又长又敏感，界面上没有意义。
+            current.addView(ui.text("已登录 · 会话同步中", 10, WatchUi.MUTED));
             ui.add(page, current, 0, 10);
         }
 
-        // ---- 已记住的设备：直接切换，不必重新配对 ----
+        // ---- 已记住的地址：直接切换，不必重新粘贴 ----
         final List<Store.Device> remembered = store.devices();
         if (remembered.size() > 0) {
-            ui.add(page, ui.text("已记住的设备", 11, WatchUi.MUTED), 0, 6);
+            ui.add(page, ui.text("已记住的地址", 11, WatchUi.MUTED), 0, 6);
             String currentBase = store.base();
             for (final Store.Device device : remembered) {
                 boolean active = device.base.equals(currentBase);
-                String kind = device.isPublic() ? "公网" : "局域网";
+                String kind = device.isPublic() ? "公网" : "内网";
                 String title = device.label.isEmpty() ? device.base : device.label;
                 ui.add(page, ui.row(title, kind + " · " + device.base,
                         () -> switchToDevice(device)), 0, active ? 8 : 6);
             }
-            ui.add(page, ui.text("点一条可直接切过去，不用重新配对。", 10, WatchUi.MUTED), 0, 10);
+            ui.add(page, ui.text("点一条可直接切过去，不用重新粘贴网址。", 10, WatchUi.MUTED), 0, 10);
         }
 
-        // ---- 外观：主题与圆屏优化 ----
+        // ---- 外观 ----
         ui.divider(page);
         ui.add(page, ui.text("外观", 11, WatchUi.MUTED), 0, 6);
 
@@ -434,67 +469,25 @@ public class MainActivity extends Activity {
                 }), 0, 10);
         ui.add(page, ui.text("圆屏优化开启时按圆形内接矩形留边，内容不会被圆弧切掉；"
                 + "方屏手表或偏好满屏可以关掉。", 10, WatchUi.MUTED), 0, 0);
-        // ---- 一键配对：手表主动找局域网里的中继，电脑上确认即可 ----
-        ui.add(page, ui.button("一键配对", true, () -> startQuickPair(page)), 0, 8);
 
         ui.divider(page);
 
-        final EditText hostField = new EditText(this);
-        hostField.setHint("地址，如 192.168.1.121 或 https://xxx.com");
-        hostField.setText(pendingHost.isEmpty() ? store.base() : pendingHost);
-        hostField.setTextSize(13);
-        hostField.setTextColor(WatchUi.FG);
-        hostField.setHintTextColor(WatchUi.MUTED);
-        hostField.setSingleLine(true);
-        hostField.setBackground(ui.surface(WatchUi.SURFACE, 14));
-        hostField.setPadding(ui.dp(10), ui.dp(9), ui.dp(10), ui.dp(9));
-        ui.add(page, hostField, 0, 8);
-
-        final EditText codeField = new EditText(this);
-        codeField.setHint("6 位配对码");
-        codeField.setText(pendingCode);
-        codeField.setTextSize(16);
-        codeField.setTextColor(WatchUi.FG);
-        codeField.setHintTextColor(WatchUi.MUTED);
-        codeField.setSingleLine(true);
-        codeField.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
-        codeField.setBackground(ui.surface(WatchUi.SURFACE, 14));
-        codeField.setPadding(ui.dp(10), ui.dp(9), ui.dp(10), ui.dp(9));
-        ui.add(page, codeField, 0, 10);
+        final EditText urlField = new EditText(this);
+        urlField.setHint("https://your-dsh/?token=…");
+        urlField.setText(pendingHost.isEmpty() ? store.base() : pendingHost);
+        urlField.setTextSize(12);
+        urlField.setTextColor(WatchUi.FG);
+        urlField.setHintTextColor(WatchUi.MUTED);
+        urlField.setSingleLine(true);
+        urlField.setBackground(ui.surface(WatchUi.SURFACE, 14));
+        urlField.setPadding(ui.dp(10), ui.dp(9), ui.dp(10), ui.dp(9));
+        ui.add(page, urlField, 0, 8);
 
         final TextView status = ui.text("", 12, WatchUi.MUTED);
         status.setPadding(ui.dp(4), ui.dp(4), ui.dp(4), ui.dp(4));
         ui.add(page, status, 0, 8);
 
-        ui.add(page, ui.button("自动查找局域网", false, () -> {
-            status.setTextColor(WatchUi.MUTED);
-            status.setText("正在查找…请保持电脑上的中继运行");
-            discovery.listen(found -> {
-                if (destroyed) return;
-                if (found.isEmpty()) {
-                    status.setTextColor(WatchUi.WARN);
-                    status.setText("没找到，请确认手表和电脑连的是同一个 WiFi，或手填地址");
-                    return;
-                }
-                Discovery.Found first = found.get(0);
-                // 广播里带端口，直接写成 host:port 存进统一地址字段。
-                hostField.setText(first.host + ":" + first.port);
-                status.setTextColor(WatchUi.OK);
-                status.setText("找到中继：" + first.host + "（如不对可手动修改）");
-            });
-        }), 0, 8);
-
-        ui.add(page, ui.button("配对并连接", true, () -> {
-            pairNow(hostField, codeField, status);
-        }), 0, 8);
-
-        // 带 autopair 启动时直接连线，免去在手表上再点一次。
-        if (autoPair) {
-            autoPair = false;
-            status.setTextColor(WatchUi.MUTED);
-            status.setText("正在按启动参数配对…");
-            postDelayed(() -> pairNow(hostField, codeField, status), 300);
-        }
+        ui.add(page, ui.button("连接", true, () -> connectNow(urlField, status)), 0, 8);
 
         if (store.paired()) {
             ui.add(page, ui.button("断开连接", false, this::disconnect), 0, 8);
@@ -503,13 +496,12 @@ public class MainActivity extends Activity {
                 else showSession(currentSessionId);
             }), 0, 0);
         }
-        ui.add(page, ui.text("一键配对会发广播找同一 WiFi 下的电脑，电脑上点「同意」即可，"
-                + "地址与令牌自动导入。也可手动填地址与配对码：局域网 IP 或公网地址（https://…）。",
-                10, WatchUi.MUTED), 0, 0);
-
+        ui.add(page, ui.text("网址就在电脑浏览器里：启动 dsh web 时打印的那条，或打开网页后地址栏里"
+                + "带 ?token= 的那条。它只在首次换取登录凭据时用一次，之后手表自己保存。"
+                + "服务器上跑着 DSH 即可，不需要中继、不需要配对。", 10, WatchUi.MUTED), 0, 0);
 
         render(page);
-        hostField.requestFocus();
+        urlField.requestFocus();
     }
 
     /** 切换到一台已记住的设备。 */
@@ -545,211 +537,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /**
-     * 一键配对：找局域网里的中继 → 请它在电脑上弹确认 → 拿到令牌 → 自动记下这台设备。
-     *
-     * 与「输入配对码」的区别只是获取令牌的方式：决定权都在电脑端
-     * （用户要在弹出的框里点同意），手表不能自己把自己配上。
-     */
-    private void startQuickPair(WatchUi.Page page) {
-        quickPairing = true;
-        showPairingProgress("正在局域网里寻找电脑…");
-        discovery.listen(found -> {
-            if (destroyed || !quickPairing) return;
-            if (found.isEmpty()) {
-                quickPairing = false;
-                showPairingProgress("没找到。请确认手表与电脑在同一个 WiFi，且电脑上的中继已启动。");
-                return;
-            }
-            // 优先选已经配对过设备的那台（大概率就是用户常用的电脑）。
-            Discovery.Found target = found.get(0);
-            for (Discovery.Found item : found) {
-                if (item.paired) {
-                    target = item;
-                    break;
-                }
-            }
-            requestPairingFrom(target);
-        });
-    }
-
-    /** 向指定中继发起配对请求，并轮询用户在电脑上的决定。 */
-    private void requestPairingFrom(final Discovery.Found target) {
-        final String base = "http://" + target.host + ":" + target.port;
-        showPairingProgress("已找到 " + (target.name.isEmpty() ? target.host : target.name)
-                + "\n正在请电脑确认…\n（请在电脑上看到提示后点「是」）");
-
-        JSONObject body = new JSONObject();
-        try {
-            body.put("name", android.os.Build.MODEL == null ? "手表" : android.os.Build.MODEL);
-            // 设备标识：中继用它认出「这台手表」，勾过「保存为常用设备」后不再弹窗。
-            body.put("deviceId", store.deviceId());
-        } catch (Exception ignored) {
-            // 仅字符串，不会失败。
-        }
-
-        api.post(base, "/api/pair/request", "", body, result -> {
-            if (destroyed || !quickPairing) return;
-            if (!result.ok) {
-                quickPairing = false;
-                showPairingProgress("请求配对失败：" + result.error);
-                return;
-            }
-            String requestId = Api.text(result.value, "requestId");
-            if (requestId.isEmpty()) {
-                quickPairing = false;
-                showPairingProgress("配对响应缺少请求号");
-                return;
-            }
-            pollPairingResult(base, target, requestId, 0);
-        });
-    }
-
-    /** 轮询配对结果（最多约 45 秒，给用户足够时间在电脑上点确认）。 */
-    private void pollPairingResult(final String base, final Discovery.Found target,
-                                   final String requestId, final int attempt) {
-        if (destroyed || !quickPairing) return;
-        if (attempt > 45) {
-            quickPairing = false;
-            showPairingProgress("等待确认超时。可以在电脑上重开一次，或用配对码方式。");
-            return;
-        }
-        postDelayed(() -> api.get(base, "/api/pair/result?id=" + Api.urlEncode(requestId), "",
-                result -> {
-                    if (destroyed || !quickPairing) return;
-                    String state = result.ok ? Api.text(result.value, "state") : "";
-                    if ("approved".equals(state)) {
-                        String grant = Api.text(result.value, "grant");
-                        exchangeGrant(base, target, grant);
-                        return;
-                    }
-                    if ("denied".equals(state)) {
-                        quickPairing = false;
-                        showPairingProgress("电脑上拒绝了这次配对。如果还想连，请再点一次。");
-                        return;
-                    }
-                    if ("expired".equals(state)) {
-                        quickPairing = false;
-                        showPairingProgress("这次请求已失效，请再点一次一键配对。");
-                        return;
-                    }
-                    pollPairingResult(base, target, requestId, attempt + 1);
-                }), 1000);
-    }
-
-    /** 用户已同意：用一次性票据换令牌，并记住这台设备。 */
-    private void exchangeGrant(final String base, final Discovery.Found target, final String grant) {
-        JSONObject body = new JSONObject();
-        try {
-            body.put("grant", grant);
-        } catch (Exception ignored) {
-            // 仅字符串，不会失败。
-        }
-        api.post(base, "/api/pair", "", body, result -> {
-            if (destroyed) return;
-            quickPairing = false;
-            if (!result.ok) {
-                showPairingProgress("换取令牌失败：" + result.error);
-                return;
-            }
-            String token = Api.text(result.value, "token");
-            if (token.isEmpty()) {
-                showPairingProgress("配对响应缺少令牌");
-                return;
-            }
-            String address = target.host + ":" + target.port;
-            // 记成一台可切换的设备；同名电脑下次直接切，不用再配对。
-            store.rememberDevice(address, token,
-                    target.name.isEmpty() ? "" : target.name);
-            // 配对响应里同时给了公网地址：一并记下，出门时不必重配。
-            store.rememberAlternate(address, Api.text(result.value, "publicUrl"), store.deviceId());
-            currentSessionId = "";
-            currentSessionTitle = "";
-            currentAsk = null;
-            steps.clear();
-            showToast("配对成功：" + (target.name.isEmpty() ? address : target.name));
-            showSessionList();
-        });
-    }
-
-    /** 一键配对过程中的进度页（只需简单反馈，不必每帧重绘整屏）。 */
-    private void showPairingProgress(String message) {
-        if (destroyed) return;
-        onSessionPage = false;
-        WatchUi.Page page = ui.page();
-        ui.heading(page, "一键配对", "");
-        LinearLayout card = ui.card();
-        TextView text = ui.text(message, 12, WatchUi.FG);
-        card.addView(text);
-        ui.add(page, card, 6, 10);
-        if (quickPairing) {
-            ui.add(page, ui.button("取消", false, () -> {
-                quickPairing = false;
-                discovery.cancel();
-                showConnect();
-            }), 0, 0);
-        } else {
-            ui.add(page, ui.button("重试", true, () -> {
-                quickPairing = true;
-                showPairingProgress("正在局域网里寻找电脑…");
-                discovery.listen(found -> {
-                    if (destroyed || !quickPairing) return;
-                    if (found.isEmpty()) {
-                        quickPairing = false;
-                        showPairingProgress("没找到。请确认手表与电脑在同一个 WiFi，且电脑上的中继已启动。");
-                        return;
-                    }
-                    Discovery.Found target = found.get(0);
-                    for (Discovery.Found item : found) {
-                        if (item.paired) {
-                            target = item;
-                            break;
-                        }
-                    }
-                    requestPairingFrom(target);
-                });
-            }), 0, 8);
-            ui.add(page, ui.button("改用手动填写", false, this::showConnect), 0, 0);
-        }
-        render(page);
-    }
-
-    /** 用给定地址与配对码完成配对。 */
-    private void tryPair(Store.Endpoint endpoint, String code, TextView status) {
-        JSONObject body = new JSONObject();
-        try {
-            body.put("code", code);
-        } catch (Exception ignored) {
-            // 仅数字内容，不会失败
-        }
-        String root = endpoint.url("/").replaceAll("/$", "");
-        api.post(root, "/api/pair", "", body, result -> {
-            if (destroyed) return;
-            if (!result.ok) {
-                status.setTextColor(WatchUi.DANGER);
-                status.setText(result.error);
-                return;
-            }
-            String token = textOf(result.value, "token");
-            if (token.isEmpty()) {
-                status.setTextColor(WatchUi.DANGER);
-                status.setText("配对响应缺少令牌");
-                return;
-            }
-            // 记成一台可切换的设备（同一地址会覆盖，不会堆重复项）。
-            store.rememberDevice(endpoint.display(), token, "");
-            // 配对响应同时给了局域网与公网两条入口，一并记下。
-            store.rememberAlternate(endpoint.display(), Api.text(result.value, "publicUrl"), store.deviceId());
-            currentSessionId = "";
-            currentSessionTitle = "";
-            currentAsk = null;
-            steps.clear();
-            status.setTextColor(WatchUi.OK);
-            status.setText("配对成功，正在载入会话…");
-            showSessionList();
-        });
-    }
-
     // ------------------------------------------------------------ 会话列表页
 
     /**
@@ -769,9 +556,6 @@ public class MainActivity extends Activity {
         refresh.removeCallbacks(listTicker);
         renderSessionListPage();
 
-        // 进列表页说明已经连上中继了：顺手同步一次公网地址。
-        syncPublicAddress();
-
         // 首次进入需要真实数据；已有数据时后台静默刷新即可。
         if (sessions.isEmpty() && projects.isEmpty()) {
             loadSessions(false, true);
@@ -782,33 +566,11 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 同步当前中继的公网地址。
-     *
-     * cloudflared 的临时地址每次重启都会变，如果手表只记着配对那一刻的地址，
-     * 中继重启后就再也连不上了。这里用**不需要令牌**的 /api/identity 取最新地址：
-     * 走局域网连上时能顺便拿到公网入口，走公网连上时则确认自己记的那条仍然有效。
-     * 失败静默处理——这只是锦上添花，不能影响正常使用。
-     */
-    private void syncPublicAddress() {
-        if (!store.paired()) return;
-        final String current = store.base();
-        api.get(baseUrl(), "/api/identity", store.token(), result -> {
-            if (destroyed || !result.ok || result.value == null) return;
-            String publicUrl = Api.text(result.value, "publicUrl");
-            if (publicUrl.isEmpty()) return;
-            // 当前用的就是这条公网地址：无需改动。
-            if (publicUrl.equals(current)) return;
-            store.rememberAlternate(current, publicUrl, "");
-        });
-    }
-
-    /**
      * 当前地址连不上时，自动试这台设备的另一个入口。
      *
-     * 同一台电脑的局域网与公网地址共用一个令牌：在家、在外应该都能连上。
-     * 以前只认「当前那一条」，一旦换了网络（IP 变了、公网域名换了）就只剩
-     * 「连不上电脑」——用户只能手动改地址。这里自动在两条之间切换，
-     * 切成功后把这条提升为当前地址，后续请求就走它。
+     * 直连之后「地址」就是 DSH 的网页地址：常见是「内网直连」与「公网隧道」两条，
+     * 各自有自己的 authority、也就有各自的 cookie。因此切换过去后必须重新兑换一次
+     * 凭据，否则那张绑在旧 authority 上的票不会被接受。
      *
      * @param onDone 切成功后回调（通常用于重试原请求）；失败不回调。
      */
@@ -817,15 +579,15 @@ public class MainActivity extends Activity {
         final String current = store.base();
         String alternate = store.alternateFor(current);
         if (alternate.isEmpty() || alternate.equals(current)) return;
+        final Store.Endpoint endpoint = Store.parse(alternate, DEFAULT_DSH_PORT);
+        if (endpoint == null) return;
 
-        api.get(alternate, "/api/identity", store.token(), result -> {
-            if (destroyed || !result.ok || result.value == null) return;
-            // 确认这个入口连的是同一台中继（服务标识一致）才切，避免连到别处。
-            String service = Api.text(result.value, "service");
-            if (!service.startsWith("dsh-watch-relay")) return;
-
+        direct.login(endpoint.url(""), store.token(), endpoint.isSecure(), result -> {
+            if (destroyed || !result.ok) return;
             store.switchBase(alternate, current);
             showToast("已切换到另一个地址：" + alternate);
+            // 事件流也绑在 authority 上，换了地址必须重建。
+            startEventStream();
             if (onDone != null) onDone.run();
         });
     }
@@ -970,7 +732,7 @@ public class MainActivity extends Activity {
         // 只有首次加载才显示「正在刷新…」；定时刷新时不要改副标题，
         // 否则文案在「正在刷新…」与正常描述之间来回跳，屏幕看起来就在抽动。
         if (!silent) loadingSession = true;
-        api.get(baseUrl(), "/api/sessions", store.token(), result -> {
+        direct.sessions(baseUrl(), store.token(), insecureTls(), false, result -> {
             loadingSession = false;
             // 必须判断「是否还在列表页」而不是「是否在会话页」：文件页、子任务页、
             // 计划页都会把 onSessionPage 置 false，只看它的话列表刷新会把这几页覆盖掉。
@@ -1035,27 +797,26 @@ public class MainActivity extends Activity {
     private void showListError(String error) {
         onSessionPage = false;
         WatchUi.Page page = ui.page();
-        ui.heading(page, "连不上电脑", "");
+        ui.heading(page, "连不上 DSH", "");
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
         ui.add(page, ui.text("地址：" + store.base(), 11, WatchUi.MUTED), 0, 12);
         ui.add(page, ui.button("重试", true, () -> {
-            // 重试前顺手同步一次公网地址：中继重启后公网域名会变，
-            // 而错误页是唯一能停留的地方，不在这里同步就永远拿不到新域名。
-            syncPublicAddress();
+            // 重试前先把事件流也拉起来：它可能是断开后掉线的。
+            startEventStream();
             showSessionList();
         }), 0, 8);
 
-        // 同一台电脑有局域网与公网两个入口，换网络后当前那条可能不通。
-        // 给一个显式切换入口，不必重新配对（配对信息是好的，只是路换了）。
+        // 同一个 DSH 可能有内网与公网两条入口：换网络后当前那条可能不通。
+        // 切过去后要重新兑换凭据（cookie 绑在 authority 上）。
         String alternate = store.alternateFor(store.base());
         if (!alternate.isEmpty()) {
             ui.add(page, ui.button("换一个地址", false, () -> {
                 tryAlternateEndpoint(this::showSessionList);
             }), 0, 6);
-            ui.add(page, ui.text("这台电脑的另一个入口：" + alternate, 10, WatchUi.MUTED), 0, 8);
+            ui.add(page, ui.text("另一个入口：" + alternate, 10, WatchUi.MUTED), 0, 8);
         }
 
-        ui.add(page, ui.button("重新配对", false, () -> {
+        ui.add(page, ui.button("重新填写网址", false, () -> {
             store.clearToken();
             showConnect();
         }), 0, 0);
@@ -1070,7 +831,7 @@ public class MainActivity extends Activity {
         ui.heading(page, "新建会话", "");
         ui.add(page, ui.text("正在创建…", 13, WatchUi.MUTED), 0, 0);
         render(page);
-        api.post(baseUrl(), "/api/create", store.token(), new JSONObject(), result -> {
+        direct.create(baseUrl(), store.token(), insecureTls(), result -> {
             if (destroyed) return;
             if (!result.ok) {
                 WatchUi.Page failed = ui.page();
@@ -1128,7 +889,7 @@ public class MainActivity extends Activity {
 
     private void loadSession(String sessionId, boolean silent) {
         if (!store.paired() || sessionId.isEmpty()) return;
-        api.get(baseUrl(), "/api/session?id=" + Api.urlEncode(sessionId), store.token(), result -> {
+        direct.session(baseUrl(), store.token(), insecureTls(), sessionId, 0L, result -> {
             if (destroyed || !onSessionPage || !sessionId.equals(currentSessionId)) return;
             // 请求在途时用户可能已经进入输入页；此时绝不能重建整屏。
             if (editing) return;
@@ -2071,7 +1832,7 @@ public class MainActivity extends Activity {
     /** 拉取子任务列表；silent 为真时只在内容变化后重绘。 */
     private void loadSubagents(final boolean silent) {
         if (!store.paired() || subagentParentId.isEmpty()) return;
-        api.get(baseUrl(), "/api/subagents?id=" + Api.urlEncode(subagentParentId), store.token(), result -> {
+        direct.subagents(baseUrl(), store.token(), insecureTls(), subagentParentId, result -> {
             if (destroyed || !onSubagentPage) return;
             if (!result.ok) {
                 // 静默刷新失败时保持现有画面，避免错误页反复重绘。
@@ -2193,7 +1954,7 @@ public class MainActivity extends Activity {
     /** 拉取计划与任务；数据来自会话响应里的 plan 块。 */
     private void loadPlan(final boolean silent) {
         if (!store.paired() || currentSessionId.isEmpty()) return;
-        api.get(baseUrl(), "/api/session?id=" + Api.urlEncode(currentSessionId), store.token(), result -> {
+        direct.session(baseUrl(), store.token(), insecureTls(), currentSessionId, 0L, result -> {
             if (destroyed || !onPlanPage) return;
             if (!result.ok) {
                 if (!silent) refreshPlanPage(result.error);
@@ -2359,7 +2120,7 @@ public class MainActivity extends Activity {
             refreshFiles("");
             return;
         }
-        api.get(baseUrl(), "/api/session?id=" + Api.urlEncode(currentSessionId), store.token(), result -> {
+        direct.session(baseUrl(), store.token(), insecureTls(), currentSessionId, 0L, result -> {
             if (destroyed || !onFilePage) return;
             if (result.ok && result.value != null) {
                 sessionFiles.clear();
@@ -2414,8 +2175,7 @@ public class MainActivity extends Activity {
         ui.heading(page, clipLine(file.name, 16), "正在读取…");
         render(page);
 
-        api.get(baseUrl(), "/api/file?session=" + Api.urlEncode(currentSessionId)
-                + "&path=" + Api.urlEncode(file.path), store.token(), result -> {
+        direct.readFile(baseUrl(), store.token(), insecureTls(), currentSessionId, file.path, result -> {
                     if (destroyed || !onFilePage) return;
                     if (!result.ok) {
                         WatchUi.Page failed = ui.page();
@@ -2518,9 +2278,7 @@ public class MainActivity extends Activity {
         }
         long through = currentBeforeSeq - 1;
         renderSession("正在读取更早的内容…");
-        api.get(baseUrl(),
-                "/api/session?id=" + Api.urlEncode(currentSessionId) + "&through=" + through,
-                store.token(), result -> {
+        direct.session(baseUrl(), store.token(), insecureTls(), currentSessionId, through, result -> {
                     if (destroyed || !onSessionPage) return;
                     if (!result.ok) {
                         renderSession("读取失败：" + result.error);
@@ -2670,7 +2428,7 @@ public class MainActivity extends Activity {
         modelProviders.clear();
         modelDefault = null;
         renderModelLoading();
-        api.get(baseUrl(), "/api/models", store.token(), result -> {
+        direct.models(baseUrl(), store.token(), insecureTls(), result -> {
             if (destroyed) return;
             if (!result.ok) {
                 renderModelError(result.error);
@@ -2832,17 +2590,8 @@ public class MainActivity extends Activity {
         ui.add(page, ui.text("正在通知电脑切换模型", 12, WatchUi.MUTED), 0, 0);
         render(page);
 
-        JSONObject body = new JSONObject();
-        try {
-            body.put("sessionId", currentSessionId);
-            body.put("provider", provider);
-            body.put("model", model);
-            if (!effort.isEmpty()) body.put("effort", effort);
-        } catch (Exception ignored) {
-            // 都是字符串，不会失败
-        }
-
-        api.post(baseUrl(), "/api/model", store.token(), body, result -> {
+        direct.selectModel(baseUrl(), store.token(), insecureTls(), currentSessionId,
+                provider, model, effort, result -> {
             if (destroyed) return;
             if (!result.ok) {
                 WatchUi.Page failed = ui.page();
@@ -2885,13 +2634,7 @@ public class MainActivity extends Activity {
     }
 
     private void cancelRun() {
-        JSONObject body = new JSONObject();
-        try {
-            body.put("sessionId", currentSessionId);
-        } catch (Exception ignored) {
-            // 不会失败
-        }
-        api.post(baseUrl(), "/api/cancel", store.token(), body, result -> {
+        direct.cancel(baseUrl(), store.token(), insecureTls(), currentSessionId, result -> {
             if (destroyed) return;
             if (!result.ok) {
                 renderSession("停止失败：" + result.error);
@@ -2943,15 +2686,8 @@ public class MainActivity extends Activity {
 
     private void sendMessage(String text) {
         editing = false;
-        JSONObject body = new JSONObject();
-        try {
-            body.put("sessionId", currentSessionId);
-            body.put("text", text);
-        } catch (Exception ignored) {
-            // 字符串不会失败
-        }
         renderSession("正在发送…");
-        api.post(baseUrl(), "/api/send", store.token(), body, result -> {
+        direct.send(baseUrl(), store.token(), insecureTls(), currentSessionId, text, "queue", result -> {
             if (destroyed || !onSessionPage) return;
             if (!result.ok) {
                 renderSession("发送失败：" + result.error);
@@ -3129,23 +2865,15 @@ public class MainActivity extends Activity {
             return;
         }
 
-        JSONObject body = new JSONObject();
-        try {
-            body.put("sessionId", ask.sessionId);
-            body.put("callId", ask.callId);
-            // 前台等待中的提问由中继按 eventId 回填 waterfall 结果，必须原样带回。
-            if (!ask.eventId.isEmpty()) body.put("eventId", ask.eventId);
-            body.put("answers", answers);
-        } catch (Exception ignored) {
-            // 不会失败
-        }
-
         WatchUi.Page page = ui.page();
         ui.heading(page, "提交中…", "");
         ui.add(page, ui.text("正在把回答发回电脑", 12, WatchUi.MUTED), 0, 0);
         render(page);
 
-        api.post(baseUrl(), "/api/answer", store.token(), body, result -> {
+        // 前台等待中的提问必须走事件流回填（DSH 只按 clientId+eventId 关联）；
+        // 已超时挂起的则退回 RPC。两条通道由 Direct.answer 按顺序尝试。
+        direct.answer(baseUrl(), store.token(), insecureTls(), ask.sessionId,
+                ask.callId == null ? "" : ask.callId, ask.eventId == null ? "" : ask.eventId, answers, result -> {
             if (destroyed) return;
             if (!result.ok) {
                 renderQuestionPage(ask, 0, chosen, "提交失败：" + result.error);

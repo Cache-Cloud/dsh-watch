@@ -8,9 +8,7 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <!-- 局域网地址直连属于明文 HTTP，Android 9 起需要显式放行。 -->
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- 不再需要 WiFi/组播权限：直连 DSH 后没有局域网发现，也没有配对广播。 -->
 
     <uses-feature android:name="android.hardware.type.watch" android:required="false" />
 

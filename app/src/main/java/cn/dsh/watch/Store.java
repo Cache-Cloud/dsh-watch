@@ -10,15 +10,18 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 手表侧的本地状态：多个中继设备的连接信息，以及当前正在用的那一台。
+ * 手表侧的本地状态：多台 DSH 的连接信息，以及当前正在用的那一台。
  *
  * 设计要点：
- * - **记住多台设备**。同一块手表可能在「家里电脑的局域网」「公司电脑的局域网」
- *   「某个公网地址」之间来回切，每次都重新输配对码很麻烦。因此每台设备
- *   （地址 + 令牌 + 备注 + 最后使用时间）单独存一条，可随时切换。
+ * - **记住多台设备**。同一个手表可能要在「内网直连」与「公网隧道」之间切，
+ *   或者连不同服务器上的 DSH；每次重新粘贴长网址很麻烦，因此每台设备
+ *   （地址 + token + 备注 + 最后使用时间）单独存一条，可随时切换。
+ * - **token 的含义变了**：它不再是中继的配对令牌，而是网址里的 `?token=`。
+ *   它只用于首次换取一张长期会话 cookie（见 DshLink），换到之后就不再需要它。
+ *   因此它必须被保存——否则 DSH 重启换了签名密钥后就没法再换票了。
  * - **base() / token() 这些原有方法保持语义不变**，它们返回「当前设备」的值。
  *   这样数十处调用点不用改，切换设备后自然生效。
- * - 旧的单设备存档会被自动迁移成列表里的第一条，用户不需要重新配对。
+ * - 旧的单设备存档会被自动迁移成列表里的第一条。
  */
 final class Store {
     private static final String FILE = "dsh-watch";
@@ -30,7 +33,7 @@ final class Store {
     /** 多设备列表（JSON 数组）。 */
     private static final String KEY_DEVICES = "devices";
 
-    /** 一台已记住的中继设备。 */
+    /** 一台已记住的 DSH 地址。 */
     static final class Device {
         /** 地址原文，形如 `192.168.1.121:19390` 或 `https://xxx.trycloudflare.com`。 */
         String base = "";
@@ -301,7 +304,7 @@ final class Store {
 
     // ------------------------------------------------------------ 当前设备（原有语义）
 
-    /** 中继地址（形如 host:port 或 https://host）。 */
+    /** DSH 地址（形如 host:port 或 https://host）。 */
     String base() {
         String value = prefs.getString(KEY_BASE, "");
         return value == null ? "" : value;
@@ -411,7 +414,7 @@ final class Store {
         }
     }
 
-    /** 一个解析好的中继地址。 */
+    /** 一个解析好的 DSH 地址。 */
     static final class Endpoint {
         /** 原始写法，直接用于显示与保存。 */
         final String raw;
@@ -474,9 +477,13 @@ final class Store {
             rest = text.substring(schemeAt + 3);
             if (!"http".equals(scheme) && !"https".equals(scheme)) return null;
         }
-        // 去掉路径与查询，只保留主机部分。
+        // 去掉路径、查询与锚点，只保留主机部分（用户粘进来的是完整网址）。
         int slash = rest.indexOf('/');
         if (slash >= 0) rest = rest.substring(0, slash);
+        int mark = rest.indexOf('?');
+        if (mark >= 0) rest = rest.substring(0, mark);
+        int hash = rest.indexOf('#');
+        if (hash >= 0) rest = rest.substring(0, hash);
         if (rest.isEmpty()) return null;
 
         String host = rest;
@@ -502,5 +509,57 @@ final class Store {
                 ? host
                 : ("http".equals(scheme) ? host + ":" + port : scheme + "://" + host + (port == 443 ? "" : ":" + port));
         return new Endpoint(canonical, scheme, host, port);
+    }
+
+    /**
+     * 从一条「带 token 的网址」里取出 token。
+     *
+     * 用户手里的网址通常是 dsh web 启动时打印的那条：
+     * `http://127.0.0.1:3377/?token=xxxx`。在服务器上它可能被换成公网域名，
+     * 但 `?token=` 这一段的形状不变，因此按查询参数取即可。
+     *
+     * @return token；没有则返回空串
+     */
+    static String tokenOf(String url) {
+        if (url == null) return "";
+        String value = url.trim();
+        int mark = value.indexOf('?');
+        if (mark < 0) return "";
+        String query = value.substring(mark + 1);
+        // token 后面还可能跟着别的参数（例如 mount），按 & 切开逐项找。
+        int hash = query.indexOf('#');
+        if (hash >= 0) query = query.substring(0, hash);
+        for (String pair : query.split("&")) {
+            int equals = pair.indexOf('=');
+            if (equals <= 0) continue;
+            if (!"token".equals(pair.substring(0, equals))) continue;
+            return decode(pair.substring(equals + 1));
+        }
+        return "";
+    }
+
+    /** 查询参数解码（token 是 base64url，一般不需要解码，但别把 %2B 当原文）。 */
+    private static String decode(String value) {
+        try {
+            return java.net.URLDecoder.decode(value, "UTF-8");
+        } catch (Exception error) {
+            return value;
+        }
+    }
+
+    /**
+     * 去掉网址里的路径与查询，只留下「协议 + 主机 + 端口」。
+     *
+     * DSH 的 RPC 一律挂在站点根下（/api/...），因此保存时要抹掉用户可能粘进来的
+     * `/?token=` 或路径片段，否则后续拼路径会拼成 `//?token=.../api/...`。
+     */
+    static String stripQuery(String url) {
+        if (url == null) return "";
+        String value = url.trim();
+        int mark = value.indexOf('?');
+        if (mark >= 0) value = value.substring(0, mark);
+        int hash = value.indexOf('#');
+        if (hash >= 0) value = value.substring(0, hash);
+        return value;
     }
 }
