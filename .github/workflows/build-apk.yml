@@ -52,6 +52,13 @@ jobs:
           scripts/fetch-sdk.sh --dest "${{ runner.temp }}/android-sdk"
 
       - name: 构建 APK
+        env:
+          # 仓库自带的固定调试密钥：保证每次 CI 产出的 APK 签名一致，
+          # 否则每次新密钥都会让「覆盖安装」失败（不同签名的 APK 不能升级安装）。
+          # 这是公开的侧载用密钥，不要用它签任何要发布到应用商店的东西。
+          DSH_WATCH_KEYSTORE: ${{ github.workspace }}/keystore/dsh-watch.jks
+          DSH_WATCH_KEYSTORE_PASSWORD: dsh-watch
+          DSH_WATCH_KEY_ALIAS: dsh-watch
         run: |
           VERSION="${{ github.event.inputs.version_name || '1.0.0' }}"
           scripts/build-apk.sh \

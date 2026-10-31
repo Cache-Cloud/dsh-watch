@@ -4,7 +4,6 @@ build/
 *.class
 *.dex
 *.apk
-*.jks
 keystore.properties
 
 # 本地下载的 Android SDK（scripts/fetch-sdk.sh 的目标目录）

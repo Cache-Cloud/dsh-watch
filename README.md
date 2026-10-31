@@ -65,9 +65,10 @@ token 只在第一次用，之后手表自己保存 cookie。地址存在手表�
 adb install -r DSH手表.apk
 ```
 
-> APK 用仓库里生成的调试密钥签名。想用自己的密钥就在 fork 里改 workflow，
-> 把 keystore 以 base64 存进仓库 Secrets，再传给 `--keystore`。
-> 用不同密钥签名的 APK 不能覆盖安装，需先卸载旧版。
+> APK 用仓库里自带的**固定调试密钥**（`keystore/dsh-watch.jks`）签名，
+> 因此每次构建出的包都能覆盖安装、平滑升级。这是一把公开的侧载用密钥，
+> 想换成自己的见 [`keystore/README.md`](keystore/README.md)——
+> 换密钥后需先卸载旧版再装。
 
 ### 方式 B：本机构建
 
