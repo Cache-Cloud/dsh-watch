@@ -24,6 +24,13 @@ final class Direct {
     private final ExecutorService pool = Executors.newFixedThreadPool(3);
     private final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
     private final DshLink link = new DshLink();
+    /** cookie 的持久化存储（连上之后由 MainActivity 注入）。 */
+    private Store store;
+
+    /** 注入持久化存储：让 cookie 能跨 App 重启复用，而不是每次都去兑换。 */
+    void attach(Store store) {
+        this.store = store;
+    }
     /** 事件流处理者：只有需要实时提问时才建立。 */
     private Events events;
 
@@ -54,11 +61,13 @@ final class Direct {
         pool.execute(() -> {
             try {
                 link.reset();
+                adoptSaved(base);
                 String cookie = link.ensureCookie(base, token, insecureTls);
                 // 用一次真实 RPC 确认这张票能用，而不是只看兑换是否成功。
                 JSONObject args = new JSONObject();
                 args.put("_request", new JSONObject());
                 JSONObject value = link.rpc(base, "session/list", args, insecureTls);
+                persistCookie(base, token);
                 JSONObject out = new JSONObject();
                 out.put("ok", true);
                 out.put("service", "dsh-direct");
@@ -71,6 +80,18 @@ final class Direct {
         });
     }
 
+    /**
+     * 只停后台活动，保留凭据与存档。
+     *
+     * App 被系统回收时该走这条：用户没点「断开连接」，下一次启动应当直接用存档 cookie。
+     */
+    void stopBackground() {
+        if (events != null) {
+            events.stop();
+            events = null;
+        }
+    }
+
     /** 断开：清凭据、停事件流。 */
     void disconnect() {
         if (events != null) {
@@ -78,6 +99,7 @@ final class Direct {
             events = null;
         }
         link.reset();
+        if (store != null) store.clearSession();
     }
 
     /** 请求失败文案：把异常翻成人话。 */
@@ -543,14 +565,40 @@ final class Direct {
             throws Exception {
         String base = trimBase(rawBase);
         try {
+            adoptSaved(base);
             link.ensureCookie(base, token, insecureTls);
+            persistCookie(base, token);
             return link.rpc(base, method, args, insecureTls);
         } catch (DshLink.UnauthorizedException error) {
-            // 票失效（DSH 重启换了签名密钥）：重新兑换一次再试。
+            // 票失效（签名密钥变了或过期）：丢掉存档、重新兑换一次再试。
             link.reset();
+            if (store != null) store.clearSession();
             link.ensureCookie(base, token, insecureTls);
+            persistCookie(base, token);
             return link.rpc(base, method, args, insecureTls);
         }
+    }
+
+    /**
+     * 如果存档里的 cookie 还匹配当前地址且没过期，就直接用它。
+     *
+     * 这样 DSH 重启（token 变了）也不影响手表：cookie 是 DSH 签发的长期凭据，
+     * 签名密钥持久化在 .credentials.yaml 里，重启不变。
+     */
+    private void adoptSaved(String base) {
+        if (store == null) return;
+        String authority = DshLink.authorityOf(base);
+        Store.Session saved = store.session();
+        if (!saved.usable(authority)) return;
+        link.adopt(saved.cookie, authority, saved.expiresAt);
+    }
+
+    /** 把刚拿到的 cookie 存下来（下次启动直接用，不必再兑换）。 */
+    private void persistCookie(String base, String token) {
+        if (store == null) return;
+        String cookie = link.cachedCookie();
+        if (cookie.isEmpty()) return;
+        store.setSession(cookie, DshLink.authorityOf(base), link.cachedExpiresAt(), token);
     }
 
     private static JSONObject listArgs() {

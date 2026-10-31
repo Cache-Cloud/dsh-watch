@@ -182,6 +182,8 @@ public class MainActivity extends Activity {
         WatchUi.applyTheme(store.theme());
         WatchUi.roundOptimized = store.roundOptimized();
         direct = new Direct();
+        // 让数据层能持久化 cookie：这样 App 重启后直接用存档票，不必再兑换一次。
+        direct.attach(store);
         // 允许从外部带入地址与配对码（例如电脑端生成一条命令让手表直接配对），
         // 省去在手表小键盘上输入 IP 的麻烦。
         applyIntentExtras(getIntent());
@@ -313,7 +315,10 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         destroyed = true;
         refresh.removeCallbacksAndMessages(null);
-        if (direct != null) direct.disconnect();
+        // 只停后台活动，不能 disconnect()——那会连凭据存档一起清掉。
+        // onDestroy 也会在系统回收 Activity 时触发，而用户并没有「断开连接」，
+        // 下次启动应当直接用存档 cookie 连上。
+        if (direct != null) direct.stopBackground();
         super.onDestroy();
     }
 
@@ -712,7 +717,9 @@ public class MainActivity extends Activity {
         return notice;
     }
 
+    /** 用户主动断开：清 token、清凭据存档、停后台活动。 */
     private void disconnect() {
+        if (direct != null) direct.disconnect();
         store.clearToken();
         sessions.clear();
         projects.clear();

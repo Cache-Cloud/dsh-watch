@@ -71,6 +71,35 @@ final class DshLink {
         return cookie != null;
     }
 
+    /**
+     * 预置一张已保存的 cookie，避免启动时再兑换一次。
+     *
+     * @param saved        形如 `dsh-auth-…=v1.…`
+     * @param authority    这张 cookie 绑定的 authority
+     * @param expiresAt    到期时间（毫秒，0 表示未知）
+     */
+    synchronized void adopt(String saved, String authority, long expiresAt) {
+        if (saved == null || saved.isEmpty()) return;
+        this.cookie = saved;
+        this.cookieAuthority = authority == null ? "" : authority;
+        this.cookieExpiresAt = expiresAt;
+    }
+
+    /** 当前 cookie 绑定的 authority（供调用方判断是否还能用）。 */
+    synchronized String cachedAuthority() {
+        return cookieAuthority;
+    }
+
+    /** 当前 cookie 的到期时间（毫秒，0 表示未知）。 */
+    synchronized long cachedExpiresAt() {
+        return cookieExpiresAt;
+    }
+
+    /** 当前持有的 cookie 原文（用于保存）；没有则空串。 */
+    synchronized String cachedCookie() {
+        return cookie == null ? "" : cookie;
+    }
+
     /** 清空缓存的凭据（断开连接时调用）。 */
     synchronized void reset() {
         cookie = null;

@@ -93,8 +93,18 @@ final class Store {
     private final SharedPreferences prefs;
 
     Store(Context context) {
-        this.prefs = context.getSharedPreferences(FILE, Context.MODE_PRIVATE);
-        migrateLegacy();
+        this(context.getSharedPreferences(FILE, Context.MODE_PRIVATE), true);
+    }
+
+    /**
+     * 直接给 SharedPreferences 的构造函数。
+     *
+     * 存在的意义是让持久化逻辑能脱离 Android 单独测试：cookie 复用这套行为
+     * 只有在「进程重启」的语义下才看得出对错，用真机反复试太慢。
+     */
+    Store(android.content.SharedPreferences prefs, boolean migrate) {
+        this.prefs = prefs;
+        if (migrate) migrateLegacy();
     }
 
     /**
@@ -561,5 +571,65 @@ final class Store {
         int hash = value.indexOf('#');
         if (hash >= 0) value = value.substring(0, hash);
         return value;
+    }
+
+    // ------------------------------------------------------------ 会话凭据（cookie）
+
+    private static final String KEY_COOKIE = "cookie";
+    private static final String KEY_COOKIE_AUTHORITY = "cookieAuthority";
+    private static final String KEY_COOKIE_EXPIRES = "cookieExpiresAt";
+    private static final String KEY_COOKIE_RAW_TOKEN = "cookieRawToken";
+
+    /** 某台设备的会话 cookie 存档。 */
+    static final class Session {
+        String cookie = "";
+        String authority = "";
+        long expiresAt;
+        /** 换到这张 cookie 时用的原始 token（用于判断是否需要重新兑换）。 */
+        String rawToken = "";
+
+        boolean usable(String wantedAuthority) {
+            if (cookie == null || cookie.isEmpty()) return false;
+            if (wantedAuthority == null || !wantedAuthority.equals(authority)) return false;
+            // 与服务端一致：过期前留 60 秒余量。
+            return expiresAt <= 0 || System.currentTimeMillis() < expiresAt - 60_000L;
+        }
+    }
+
+    /** 读当前设备的 cookie 存档。 */
+    Session session() {
+        Session session = new Session();
+        session.cookie = prefs.getString(KEY_COOKIE, "");
+        session.authority = prefs.getString(KEY_COOKIE_AUTHORITY, "");
+        session.expiresAt = prefs.getLong(KEY_COOKIE_EXPIRES, 0L);
+        session.rawToken = prefs.getString(KEY_COOKIE_RAW_TOKEN, "");
+        return session;
+    }
+
+    /**
+     * 保存一张会话 cookie。
+     *
+     * 为什么要存：cookie 是 DSH 签发的、绑定 authority 的长期凭据，本身有效期就有
+     * 十年，而置换它的 token 只活一个进程。把 cookie 存下来之后，DSH 重启换了 token
+     * 也不影响手表——只要 cookie 还在有效期内、且 DSH 的签名密钥没变
+     * （密钥持久化在 .credentials.yaml，实测重启不变）。
+     */
+    void setSession(String cookie, String authority, long expiresAt, String rawToken) {
+        prefs.edit()
+                .putString(KEY_COOKIE, cookie == null ? "" : cookie)
+                .putString(KEY_COOKIE_AUTHORITY, authority == null ? "" : authority)
+                .putLong(KEY_COOKIE_EXPIRES, expiresAt)
+                .putString(KEY_COOKIE_RAW_TOKEN, rawToken == null ? "" : rawToken)
+                .apply();
+    }
+
+    /** 丢掉 cookie（凭据失效或换地址时）。 */
+    void clearSession() {
+        prefs.edit()
+                .remove(KEY_COOKIE)
+                .remove(KEY_COOKIE_AUTHORITY)
+                .remove(KEY_COOKIE_EXPIRES)
+                .remove(KEY_COOKIE_RAW_TOKEN)
+                .apply();
     }
 }
