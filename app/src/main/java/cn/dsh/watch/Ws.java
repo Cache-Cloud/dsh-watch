@@ -79,17 +79,19 @@ final class Ws {
         new SecureRandom().nextBytes(nonce);
         String key = Base64.getEncoder().encodeToString(nonce);
 
+        // 默认端口不写出来：DSH 由 Host 推导 authority，再据此算出 cookie 名并校验。
+        // 若 https 写成 host:443，推导出的 authority 与签发 cookie 时的 origin 对不上，
+        // 会直接 401（而 403 反而是 Origin 与 authority 不一致时的表现）。
+        boolean defaultPort = (tls && port == 443) || (!tls && port == 80);
+        String authority = defaultPort ? host : (host + ":" + port);
         StringBuilder request = new StringBuilder();
         request.append("GET ").append(path).append(" HTTP/1.1\r\n");
-        request.append("Host: ").append(host).append(':').append(port).append("\r\n");
+        request.append("Host: ").append(authority).append("\r\n");
         request.append("Upgrade: websocket\r\n");
         request.append("Connection: Upgrade\r\n");
         request.append("Sec-WebSocket-Key: ").append(key).append("\r\n");
         request.append("Sec-WebSocket-Version: 13\r\n");
-        // Origin 必须与请求的 authority 完全一致（含端口）：DSH 的请求信任校验
-        // 会比对 Origin 与 Host，漏掉端口就会被当成跨域而返回 403。
-        request.append("Origin: ").append(tls ? "https://" : "http://")
-                .append(host).append(':').append(port).append("\r\n");
+        request.append("Origin: ").append(tls ? "https://" : "http://").append(authority).append("\r\n");
         if (cookie != null && !cookie.isEmpty()) {
             request.append("Cookie: ").append(cookie).append("\r\n");
         }

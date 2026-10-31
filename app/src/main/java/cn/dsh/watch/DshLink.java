@@ -180,7 +180,7 @@ final class DshLink {
             throws Exception {
         String body = "{\"type\":\"client-request\",\"rpcId\":\"" + UUID.randomUUID().toString()
                 + "\",\"method\":\"" + escape(method) + "\",\"payload\":{\"args\":" + args.toString() + "}}";
-        String text = post(base, "/api/" + method, body, insecureTls);
+        String text = post(base, "/api/" + method, method, body, insecureTls);
         JSONObject envelope = new JSONObject(text);
         JSONObject result = envelope.optJSONObject("result");
         if (result == null) throw new Exception(method + " 的响应缺少 result");
@@ -209,7 +209,8 @@ final class DshLink {
         return message;
     }
 
-    private String post(String base, String path, String body, boolean insecureTls) throws Exception {
+    private String post(String base, String path, String methodName, String body, boolean insecureTls)
+            throws Exception {
         if (cookie == null) throw new Exception("尚未登录，请先在设置页填写带 token 的网址");
         HttpURLConnection connection = null;
         try {
@@ -231,6 +232,10 @@ final class DshLink {
                     ? connection.getInputStream() : connection.getErrorStream();
             String text = readAll(stream);
             if (status == 401) throw new UnauthorizedException("登录凭据已失效，请重新填写网址");
+            if (status == 405) {
+                throw new Exception("这个地址不接受 " + methodName + " 请求（HTTP 405）。"
+                        + "通常是网址末尾多了斜杠，请只填到端口为止，例如 https://host:3377");
+            }
             if (status < 200 || status >= 300) throw new Exception("服务返回错误（" + status + "）");
             return text;
         } finally {

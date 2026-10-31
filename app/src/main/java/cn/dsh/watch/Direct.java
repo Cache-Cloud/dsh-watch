@@ -49,7 +49,8 @@ final class Direct {
      * 这一步是全流程的关键：用「带 token 的网址」换一张十年有效的会话 cookie。
      * 换成功就说明地址、token、域名围栏都对得上，后面所有请求都用这张票。
      */
-    void login(final String base, final String token, final boolean insecureTls, final Callback callback) {
+    void login(final String rawBase, final String token, final boolean insecureTls, final Callback callback) {
+        final String base = trimBase(rawBase);
         pool.execute(() -> {
             try {
                 link.reset();
@@ -82,10 +83,22 @@ final class Direct {
     /** 请求失败文案：把异常翻成人话。 */
     static String friendly(Exception error) {
         String message = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
-        if (error instanceof java.net.SocketTimeoutException) return "连接超时，请确认 DSH 还在运行";
-        if (error instanceof java.net.ConnectException) return "连不上这个地址，请检查网络与地址";
-        if (error instanceof java.net.UnknownHostException) return "找不到这个地址";
-        if (message.contains("401")) return "登录凭据已失效，请重新填写网址";
+        // 文案要指向真正的原因：说错方向比不说更耽误事。
+        if (error instanceof java.net.SocketTimeoutException) {
+            return "连接超时：网络能通但服务器没在限定时间内回应。"
+                    + "如果是手表走公网，多半是隧道或反代把请求卡住了";
+        }
+        if (error instanceof java.net.ConnectException) {
+            return "连不上这个地址：域名解析到了，但对方端口没有服务在监听。"
+                    + "请确认地址与端口（dsh web 默认 3377）";
+        }
+        if (error instanceof java.net.UnknownHostException) {
+            return "找不到这个域名，请检查地址是否拼错";
+        }
+        if (error instanceof java.net.SocketException) {
+            return "网络连接被中断：" + message;
+        }
+        if (message.contains("401")) return "登录凭据已失效：token 可能已随 DSH 重启更换，请重新粘贴网址";
         return message;
     }
 
@@ -512,8 +525,23 @@ final class Direct {
     // ---------------------------------------------------------------- 内部
 
     /** 统一入口：必要时重新兑换 cookie，再发 RPC。 */
-    private JSONObject rpc(String base, String token, boolean insecureTls, String method, JSONObject args)
+    /**
+     * 去掉 base 末尾的斜杠。
+     *
+     * 这个细节很容易踩：Endpoint.url("") 会拼出 `https://host/`（以 / 结尾），
+     * 再拼 `/api/...` 就变成 `https://host//api/...`。DSH 用的是精确路径匹配，
+     * 双斜杠会直接返回 405，并且错误文案看起来像“服务器没起来”，非常误导。
+     */
+    static String trimBase(String base) {
+        if (base == null) return "";
+        String value = base;
+        while (value.endsWith("/")) value = value.substring(0, value.length() - 1);
+        return value;
+    }
+
+    private JSONObject rpc(String rawBase, String token, boolean insecureTls, String method, JSONObject args)
             throws Exception {
+        String base = trimBase(rawBase);
         try {
             link.ensureCookie(base, token, insecureTls);
             return link.rpc(base, method, args, insecureTls);
